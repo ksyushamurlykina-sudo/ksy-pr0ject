@@ -578,13 +578,15 @@ def get_google_creds():
 
 def save_feedback(uid, uname, day, status, difficulty, feedback):
     try:
+        creds_json = os.environ.get("GOOGLE_CREDS_JSON", "")
+        logger.info(f"Sheets: GOOGLE_CREDS_JSON присутній: {bool(creds_json)}, довжина: {len(creds_json)}")
         creds = get_google_creds()
         sheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).sheet1
         now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
         sheet.append_row([str(uid), uname, day, status, difficulty, feedback, now])
         logger.info(f"Sheets: збережено день {day} від {uname}")
     except Exception as e:
-        logger.error(f"Sheets помилка: {e}")
+        logger.error(f"Sheets помилка: {type(e).__name__}: {e}")
 
 # ─── ХЕЛПЕРИ ─────────────────────────────────────────────────────────────────
 
