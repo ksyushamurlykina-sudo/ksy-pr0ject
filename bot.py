@@ -563,15 +563,22 @@ def set_user(uid: int, data: dict):
 
 # ─── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 
+def get_google_creds():
+    """Завантажує credentials з env-змінної або з файлу."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_json = os.environ.get("GOOGLE_CREDS_JSON")
+    if creds_json:
+        import json as _json
+        info = _json.loads(creds_json)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    return Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+
 def save_feedback(uid, uname, day, status, difficulty, feedback):
     try:
-        creds = Credentials.from_service_account_file(
-            GOOGLE_CREDS_FILE,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
-        )
+        creds = get_google_creds()
         sheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).sheet1
         now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
         sheet.append_row([str(uid), uname, day, status, difficulty, feedback, now])
