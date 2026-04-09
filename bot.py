@@ -691,9 +691,15 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    caller = update.effective_user.id
+    logger.info(f"/stats від {caller}, ADMIN_ID={ADMIN_ID}, match={caller == ADMIN_ID}")
+    if caller != ADMIN_ID:
+        await update.message.reply_text("Ця команда доступна тільки адміну.")
         return
     state = load_state()
+    if not state:
+        await update.message.reply_text("Ще нема учасників.")
+        return
     lines = [f"Учасників: {len(state)}\n"]
     for uid, s in state.items():
         lines.append(f"  {uid} — день {s.get('day', 0)}/14")
