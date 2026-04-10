@@ -530,23 +530,68 @@ logger = logging.getLogger(__name__)
 
 pending_replies: dict = {}
 
-# ─── СТАН ─────────────────────────────────────────────────────────────────────
+# ─── СТАН (Google Sheets аркуш "state" — основне сховище) ─────────────────────
+
+_state_cache: dict = {}
+
+def _get_state_sheet():
+    """Повертає аркуш 'state' з Google Sheets."""
+    creds = get_google_creds()
+    workbook = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return workbook.worksheet("state")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = workbook.add_worksheet(title="state", rows=100, cols=5)
+        ws.append_row(["uid", "day", "step", "difficulty", "done_today"])
+        return ws
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    global _state_cache
+    if _state_cache:
+        return _state_cache
+    try:
+        ws = _get_state_sheet()
+        rows = ws.get_all_values()
+        state = {}
+        for row in rows[1:]:  # пропускаємо заголовок
+            if len(row) < 5:
+                continue
+            uid_str = row[0]
+            try:
+                day = int(row[1])
+            except ValueError:
+                day = 0
+            state[uid_str] = {
+                "day": day,
+                "step": row[2] if row[2] else None,
+                "difficulty": row[3],
+                "done_today": row[4] == "True",
+            }
+        _state_cache = state
+        logger.info(f"Завантажено стан з Sheets: {len(state)} учасників")
+        return state
+    except Exception as e:
+        logger.error(f"Не вдалось завантажити стан: {type(e).__name__}: {e}")
+        return _state_cache if _state_cache else {}
 
 def save_state(state: dict):
+    global _state_cache
+    _state_cache = state
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        ws = _get_state_sheet()
+        rows = [["uid", "day", "step", "difficulty", "done_today"]]
+        for uid_str, s in state.items():
+            rows.append([
+                uid_str,
+                str(s.get("day", 0)),
+                s.get("step") or "",
+                s.get("difficulty", ""),
+                str(s.get("done_today", False)),
+            ])
+        ws.clear()
+        ws.update(rows, "A1")
     except Exception as e:
-        logger.error(f"Не вдалось зберегти стан: {e}")
+        logger.error(f"Не вдалось зберегти стан: {type(e).__name__}: {e}")
 
 def get_user(uid: int) -> dict:
     state = load_state()
