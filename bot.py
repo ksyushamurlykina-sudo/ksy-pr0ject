@@ -675,7 +675,32 @@ def start_kb():
 # ─── КОМАНДИ ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or str(uid)
+    state = load_state()
+
+    # Якщо юзер вже існує — питаємо адміна
+    if str(uid) in state and state[str(uid)].get("day", 0) > 0:
+        current_day = state[str(uid)]["day"]
+        await update.message.reply_text(
+            "Ваш запит на перезапуск надіслано досліднику. Очікуйте підтвердження."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"⚠️ Запит на перезапуск\n"
+                f"@{uname} (id: {uid})\n"
+                f"Поточний день: {current_day}/14\n\n"
+                f"Дозволити скинути прогрес і почати заново?"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Дозволити", callback_data=f"restart_yes_{uid}"),
+                InlineKeyboardButton("❌ Відхилити", callback_data=f"restart_no_{uid}"),
+            ]]),
+        )
+        return
+
+    # Новий юзер — стандартний старт
     set_user(uid, {"day": 0, "step": None, "difficulty": "", "done_today": False})
     await update.message.reply_text(
         day_text(0), parse_mode="Markdown", reply_markup=start_kb()
@@ -768,15 +793,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── КНОПКИ ──────────────────────────────────────────────────────────────────
 
-async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Ця команда доступна тільки адміну.")
-        return
-    await update.message.reply_text("Запускаю розсилку...")
-    await job_morning(context)
-    await update.message.reply_text("Готово — завдання дня надіслані всім учасникам.")
-
-
+async def send_after_day_message(bot, uid, day):
     """Відправляє проміжне повідомлення (підсумок блоку) після завершення дня."""
     msg = AFTER_DAY.get(day)
     if msg:
@@ -794,6 +811,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uname = q.from_user.username or str(uid)
     u     = get_user(uid)
     data  = q.data
+
+    # --- Дозвіл/відхилення перезапуску (адмін) ---
+    if data.startswith("restart_yes_"):
+        target_uid = int(data.replace("restart_yes_", ""))
+        set_user(target_uid, {"day": 0, "step": None, "difficulty": "", "done_today": False})
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text="Дослідник дозволив перезапуск. Починаємо спочатку!",
+        )
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text=day_text(0),
+            parse_mode="Markdown",
+            reply_markup=start_kb(),
+        )
+        await q.edit_message_text("✅ Перезапуск дозволено. Прогрес скинуто.")
+        return
+
+    if data.startswith("restart_no_"):
+        target_uid = int(data.replace("restart_no_", ""))
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text="Дослідник відхилив запит на перезапуск. Ваш прогрес збережено — продовжуйте з того місця, де зупинились.",
+        )
+        await q.edit_message_text("❌ Перезапуск відхилено.")
+        return
+
+    # --- Вибіркова розсилка (адмін) ---
+    if data.startswith("sendone_"):
+        target_uid = int(data.replace("sendone_", ""))
+        state = load_state()
+        s = state.get(str(target_uid))
+        if not s:
+            await q.answer("Юзера не знайдено.", show_alert=True)
+            return
+        day = s.get("day", 0)
+        if not (1 <= day <= 14):
+            await q.answer("Юзер не в активній програмі.", show_alert=True)
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=day_text(day),
+                parse_mode="Markdown",
+            )
+            await q.answer(f"Надіслано день {day}.", show_alert=True)
+        except Exception as e:
+            await q.answer(f"Помилка: {e}", show_alert=True)
+        return
 
     # --- Пропустити фідбек ---
     if data == "skip_feedback":
@@ -1019,6 +1085,39 @@ async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Спойлер 5 {uid_str}: {e}")
 
+async def cmd_send_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: показує список юзерів з кнопками для вибіркової розсилки."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Ця команда доступна тільки адміну.")
+        return
+    state = load_state(force_refresh=True)
+    if not state:
+        await update.message.reply_text("Ще нема учасників.")
+        return
+    buttons = []
+    for uid_str, s in state.items():
+        day = s.get("day", 0)
+        if 1 <= day <= 14:
+            done = "✅" if s.get("done_today") else "⏳"
+            label = f"{done} id:{uid_str} · день {day}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"sendone_{uid_str}")])
+    if not buttons:
+        await update.message.reply_text("Немає активних учасників.")
+        return
+    await update.message.reply_text(
+        "Оберіть учасника — надішлю йому завдання поточного дня:\n✅ = вже виконав, ⏳ = ще ні",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін-команда: вручну надіслати завдання дня всім учасникам."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Ця команда доступна тільки адміну.")
+        return
+    await update.message.reply_text("Запускаю розсилку...")
+    await job_morning(context)
+    await update.message.reply_text("Готово — завдання дня надіслані всім учасникам.")
+
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -1038,7 +1137,8 @@ def main():
     app.add_handler(CommandHandler("done",     cmd_done))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("stats",    cmd_stats))
-    app.add_handler(CommandHandler("send_now", cmd_send_now))
+    app.add_handler(CommandHandler("send_now",    cmd_send_now))
+    app.add_handler(CommandHandler("send_select", cmd_send_select))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
