@@ -17,9 +17,9 @@ GOOGLE_SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID", "ВСТАВТЕ_ID")
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "google_creds.json")
 ADMIN_ID          = 180212299
 TIMEZONE          = pytz.timezone("Europe/Kyiv")
-MORNING_TIME      = time(9, 0)
-EVENING_TIME      = time(20, 0)
-SPOILER_TIME      = time(17, 50)
+MORNING_TIME      = time(9, 35, tzinfo=TIMEZONE)
+EVENING_TIME      = time(20, 0, tzinfo=TIMEZONE)
+SPOILER_TIME      = time(17, 50, tzinfo=TIMEZONE)
 STATE_FILE        = "state.json"
 POST_SURVEY_LINK  = "ВСТАВТЕ_ПОСИЛАННЯ"
 
@@ -533,6 +533,8 @@ pending_replies: dict = {}
 # ─── СТАН (Google Sheets аркуш "state" — основне сховище) ─────────────────────
 
 _state_cache: dict = {}
+_cache_time: float = 0
+CACHE_TTL = 300  # перечитувати з Sheets кожні 5 хвилин
 
 def _get_state_sheet():
     """Повертає аркуш 'state' з Google Sheets."""
@@ -545,9 +547,11 @@ def _get_state_sheet():
         ws.append_row(["uid", "day", "step", "difficulty", "done_today"])
         return ws
 
-def load_state() -> dict:
-    global _state_cache
-    if _state_cache:
+def load_state(force_refresh=False) -> dict:
+    global _state_cache, _cache_time
+    import time as _time
+    now = _time.time()
+    if _state_cache and not force_refresh and (now - _cache_time) < CACHE_TTL:
         return _state_cache
     try:
         ws = _get_state_sheet()
@@ -568,6 +572,7 @@ def load_state() -> dict:
                 "done_today": row[4] == "True",
             }
         _state_cache = state
+        _cache_time = now
         logger.info(f"Завантажено стан з Sheets: {len(state)} учасників")
         return state
     except Exception as e:
@@ -575,8 +580,10 @@ def load_state() -> dict:
         return _state_cache if _state_cache else {}
 
 def save_state(state: dict):
-    global _state_cache
+    global _state_cache, _cache_time
+    import time as _time
     _state_cache = state
+    _cache_time = _time.time()
     try:
         ws = _get_state_sheet()
         rows = [["uid", "day", "step", "difficulty", "done_today"]]
@@ -750,7 +757,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if caller != ADMIN_ID:
         await update.message.reply_text("Ця команда доступна тільки адміну.")
         return
-    state = load_state()
+    state = load_state(force_refresh=True)
     if not state:
         await update.message.reply_text("Ще нема учасників.")
         return
@@ -761,7 +768,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── КНОПКИ ──────────────────────────────────────────────────────────────────
 
-async def send_after_day_message(bot, uid, day):
+async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Ця команда доступна тільки адміну.")
+        return
+    await update.message.reply_text("Запускаю розсилку...")
+    await job_morning(context)
+    await update.message.reply_text("Готово — завдання дня надіслані всім учасникам.")
+
+
     """Відправляє проміжне повідомлення (підсумок блоку) після завершення дня."""
     msg = AFTER_DAY.get(day)
     if msg:
@@ -800,7 +815,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["day"] = 1
             u["done_today"] = False
             set_user(uid, u)
-        await q.edit_message_text(day_text(1), parse_mode="Markdown")
+        try:
+            await q.edit_message_text(day_text(1), parse_mode="Markdown")
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                raise
         return
 
     # --- Навігація по днях (перегляд) ---
@@ -940,7 +959,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── ПЛАНУВАЛЬНИК ─────────────────────────────────────────────────────────────
 
 async def job_morning(context: ContextTypes.DEFAULT_TYPE):
-    state = load_state()
+    state = load_state(force_refresh=True)
     for uid_str, s in state.items():
         day = s.get("day", 0)
 
@@ -964,7 +983,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
 
 async def job_evening(context: ContextTypes.DEFAULT_TYPE):
-    state = load_state()
+    state = load_state(force_refresh=True)
     for uid_str, s in state.items():
         day = s.get("day", 0)
 
@@ -1003,6 +1022,15 @@ async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
+    # Захист від запуску кількох екземплярів одночасно
+    import fcntl
+    lock_fh = open("/tmp/ksy_bot.lock", "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        logger.error("Бот вже запущений! Завершення.")
+        raise SystemExit(1)
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
@@ -1010,6 +1038,7 @@ def main():
     app.add_handler(CommandHandler("done",     cmd_done))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("send_now", cmd_send_now))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1024,7 +1053,7 @@ def main():
     )
 
     logger.info("Бот запущено.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
