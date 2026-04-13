@@ -499,8 +499,8 @@ AFTER_DAY = {
 SPOILER_5 = (
     "||Ну шо, довго трималися? Скільки секунд пройшло між «о, заблюрений текст» "
     "і натисканням? Чи встигли зробити STOP? Чи палець був швидший за думку?\n\n"
-    "Якщо тапнули одразу — не переживайте — це справді була підступна підстава! "
-    "Але це точно не останній пуш за сьогодні. Спробуйте ще.||"
+    "Якщо тапнули одразу — не переживайте — це справді була підступна підстава\\! "
+    "Але це точно не останній пуш за сьогодні\\. Спробуйте ще\\. ||"
 )
 
 DIFFICULTY_LABELS = {
@@ -806,6 +806,14 @@ async def send_after_day_message(bot, uid, day):
         except Exception as e:
             logger.error(f"After-day {day} для {uid}: {e}")
 
+async def safe_edit(q, text, **kwargs):
+    """edit_message_text що мовчки ігнорує 'Message is not modified'."""
+    try:
+        await safe_edit(q, text, **kwargs)
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            raise
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -828,7 +836,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=start_kb(),
         )
-        await q.edit_message_text("✅ Перезапуск дозволено. Прогрес скинуто.")
+        await safe_edit(q, "✅ Перезапуск дозволено. Прогрес скинуто.")
         return
 
     if data.startswith("restart_no_"):
@@ -837,7 +845,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=target_uid,
             text="Дослідник відхилив запит на перезапуск. Ваш прогрес збережено — продовжуйте з того місця, де зупинились.",
         )
-        await q.edit_message_text("❌ Перезапуск відхилено.")
+        await safe_edit(q, "❌ Перезапуск відхилено.")
         return
 
     # --- Вибіркова розсилка (адмін) ---
@@ -873,7 +881,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
         reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
-        await q.edit_message_text(f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}.")
+        await safe_edit(q, f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}.")
         await send_after_day_message(context.bot, uid, day)
         return
 
@@ -884,7 +892,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["done_today"] = False
             set_user(uid, u)
         try:
-            await q.edit_message_text(day_text(1), parse_mode="Markdown")
+            await safe_edit(q, day_text(1), parse_mode="Markdown")
         except Exception as e:
             if "Message is not modified" not in str(e):
                 raise
@@ -910,7 +918,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
         kb = InlineKeyboardMarkup([buttons]) if buttons else None
-        await q.edit_message_text(
+        await safe_edit(q, 
             day_text(view_day), parse_mode="Markdown", reply_markup=kb
         )
         return
@@ -921,7 +929,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["difficulty"] = f"{emoji} {DIFFICULTY_LABELS.get(emoji, '')}"
         u["step"] = "awaiting_feedback"
         set_user(uid, u)
-        await q.edit_message_text(
+        await safe_edit(q, 
             f"Зафіксувала: {u['difficulty']}\n\n"
             "Поділіться враженнями або задайте запитання. "
             "Я відповім на нього особисто.",
@@ -940,12 +948,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if done:
             u["step"] = "awaiting_difficulty"
             set_user(uid, u)
-            await q.edit_message_text(
+            await safe_edit(q, 
                 "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
             )
         else:
             save_feedback(uid, uname, day, "ні", "", "")
-            await q.edit_message_text(
+            await safe_edit(q, 
                 "Нічого страшного. Завтра надішлю це ж завдання ще раз."
             )
 
