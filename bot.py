@@ -13,6 +13,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "ВСТАВТЕ_ТОКЕН")
+WEBHOOK_HOST      = os.environ.get("RAILWAY_STATIC_URL", "")   # Railway виставляє автоматично
+PORT              = int(os.environ.get("PORT", 8080))
 GOOGLE_SHEET_ID   = os.environ.get("GOOGLE_SHEET_ID", "ВСТАВТЕ_ID")
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "google_creds.json")
 ADMIN_ID          = 180212299
@@ -871,7 +873,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
         reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
-        await q.edit_message_text(f"{reaction}\nЗавтра о 09:00 — наступне завдання.")
+        await q.edit_message_text(f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}.")
         await send_after_day_message(context.bot, uid, day)
         return
 
@@ -1003,7 +1005,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
 
         await update.message.reply_text(
-            f"{reaction}\nЗавтра о 09:00 — наступне завдання."
+            f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}."
         )
         await send_after_day_message(context.bot, uid, day)
         return
@@ -1034,6 +1036,7 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             day = 1
 
         s["done_today"] = False
+        s["step"] = None  # скидаємо незавершений фідбек
         state[uid_str] = s
 
         if 1 <= day <= 14:
@@ -1044,7 +1047,12 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
             except Exception as e:
-                logger.error(f"Ранок {uid_str}: {e}")
+                if "Chat not found" in str(e) or "bot was blocked" in str(e).lower() or "user is deactivated" in str(e).lower():
+                    logger.warning(f"Ранок {uid_str}: неактивний юзер — {e}")
+                    s["inactive"] = True
+                    state[uid_str] = s
+                else:
+                    logger.error(f"Ранок {uid_str}: {e}")
 
     save_state(state)
 
@@ -1069,7 +1077,10 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=eve_kb(day),
                 )
             except Exception as e:
-                logger.error(f"Вечір {uid_str}: {e}")
+                if "Chat not found" in str(e) or "bot was blocked" in str(e).lower() or "user is deactivated" in str(e).lower():
+                    logger.warning(f"Вечір {uid_str}: неактивний юзер — {e}")
+                else:
+                    logger.error(f"Вечір {uid_str}: {e}")
 
 async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
     """Відправляє спойлер о 17:50 тим, хто зараз на дні 5."""
@@ -1083,7 +1094,82 @@ async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="MarkdownV2",
                 )
             except Exception as e:
-                logger.error(f"Спойлер 5 {uid_str}: {e}")
+                if "Chat not found" in str(e) or "bot was blocked" in str(e).lower() or "user is deactivated" in str(e).lower():
+                    logger.warning(f"Спойлер 5 {uid_str}: неактивний юзер — {e}")
+                else:
+                    logger.error(f"Спойлер 5 {uid_str}: {e}")
+
+async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: видалити юзера зі стану за ID. Використання: /remove_user 123456789"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Використання: /remove_user <ID>")
+        return
+    uid_str = context.args[0]
+    state = load_state()
+    if uid_str not in state:
+        await update.message.reply_text(f"ID {uid_str} не знайдено в базі.")
+        return
+    del state[uid_str]
+    save_state(state)
+    await update.message.reply_text(f"✅ Юзера {uid_str} видалено.")
+
+async def cmd_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: показати юзерів, які заблокували бота."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    state = load_state(force_refresh=True)
+    inactive = [(uid, s) for uid, s in state.items() if s.get("inactive")]
+    if not inactive:
+        await update.message.reply_text("Неактивних юзерів не виявлено.")
+        return
+    lines = [f"Заблокували бота ({len(inactive)}):"]
+    for uid, s in inactive:
+        lines.append(f"  id:{uid} — день {s.get('day', 0)}/14")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: надіслати собі будь-який день без зміни стану учасників.
+    Використання: /test_day 3
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Використання: /test_day <номер дня 0–14>")
+        return
+    n = int(args[0])
+    if n not in DAYS:
+        await update.message.reply_text(f"День {n} не існує. Доступно: 0–14.")
+        return
+    await update.message.reply_text(
+        f"🧪 _Тест дня {n} — тільки для тебе, стан учасників не змінено_",
+        parse_mode="Markdown",
+    )
+    await update.message.reply_text(day_text(n), parse_mode="Markdown")
+
+    # Показати також вечірню кнопку, якщо день активний
+    if 1 <= n <= 14:
+        await update.message.reply_text(
+            f"🧪 _Вечірнє повідомлення дня {n}:_",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(
+            (f"*Вечірня перевірка — день {n}*\n\n"
+            f"Як пройшов день?\nВдалося виконати «{DAYS[n]['title']}»?"),
+            parse_mode="Markdown",
+            reply_markup=eve_kb(n),
+        )
+
+    # Показати підсумок блоку, якщо є
+    after = AFTER_DAY.get(n)
+    if after:
+        await update.message.reply_text(
+            f"🧪 _Підсумок блоку після дня {n}:_",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(after["text"], parse_mode="Markdown")
 
 async def cmd_send_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін: показує список юзерів з кнопками для вибіркової розсилки."""
@@ -1121,15 +1207,6 @@ async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
-    # Захист від запуску кількох екземплярів одночасно
-    import fcntl
-    lock_fh = open("/tmp/ksy_bot.lock", "w")
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        logger.error("Бот вже запущений! Завершення.")
-        raise SystemExit(1)
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
@@ -1139,6 +1216,9 @@ def main():
     app.add_handler(CommandHandler("stats",    cmd_stats))
     app.add_handler(CommandHandler("send_now",    cmd_send_now))
     app.add_handler(CommandHandler("send_select", cmd_send_select))
+    app.add_handler(CommandHandler("test_day",   cmd_test_day))
+    app.add_handler(CommandHandler("inactive",     cmd_inactive))
+    app.add_handler(CommandHandler("remove_user",  cmd_remove_user))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1153,7 +1233,21 @@ def main():
     )
 
     logger.info("Бот запущено.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    if WEBHOOK_HOST:
+        # Railway / production — webhook (без конфліктів між деплоями)
+        webhook_url = f"https://{WEBHOOK_HOST}"
+        logger.info(f"Запуск через webhook: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="",
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+    else:
+        # Локально — polling
+        logger.info("Запуск через polling (локальний режим)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
