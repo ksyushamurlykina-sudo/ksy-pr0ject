@@ -809,7 +809,7 @@ async def send_after_day_message(bot, uid, day):
 async def safe_edit(q, text, **kwargs):
     """edit_message_text що мовчки ігнорує 'Message is not modified'."""
     try:
-        await safe_edit(q, text, **kwargs)
+        await q.edit_message_text(text, **kwargs)
     except Exception as e:
         if "Message is not modified" not in str(e):
             raise
