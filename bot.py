@@ -873,6 +873,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Пропустити фідбек ---
     if data == "skip_feedback":
+        if u.get("done_today") or u.get("step") != "awaiting_feedback":
+            await safe_edit(q, "Вже зафіксовано ✅")
+            return
         day = u.get("day", 0)
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, "")
@@ -945,6 +948,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done  = parts[1] == "yes"
         day   = int(parts[2])
 
+        if u.get("done_today"):
+            await safe_edit(q, "Вже зафіксовано ✅")
+            return
         if done:
             u["step"] = "awaiting_difficulty"
             set_user(uid, u)
