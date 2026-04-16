@@ -572,6 +572,7 @@ def load_state(force_refresh=False) -> dict:
                 "step": row[2] if row[2] else None,
                 "difficulty": row[3],
                 "done_today": row[4] == "True",
+                "last_done": row[5] if len(row) > 5 else "",
             }
         _state_cache = state
         _cache_time = now
@@ -588,7 +589,7 @@ def save_state(state: dict):
     _cache_time = _time.time()
     try:
         ws = _get_state_sheet()
-        rows = [["uid", "day", "step", "difficulty", "done_today"]]
+        rows = [["uid", "day", "step", "difficulty", "done_today", "last_done"]]
         for uid_str, s in state.items():
             rows.append([
                 uid_str,
@@ -596,6 +597,7 @@ def save_state(state: dict):
                 s.get("step") or "",
                 s.get("difficulty", ""),
                 str(s.get("done_today", False)),
+                s.get("last_done", ""),
             ])
         ws.clear()
         ws.update(rows, "A1")
@@ -873,14 +875,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Пропустити фідбек ---
     if data == "skip_feedback":
-        if u.get("done_today") or u.get("step") != "awaiting_feedback":
-            await safe_edit(q, "Вже зафіксовано ✅")
-            return
         day = u.get("day", 0)
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, "")
         u["step"]       = None
         u["done_today"] = True
+        u["last_done"]  = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
         reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
@@ -948,9 +948,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done  = parts[1] == "yes"
         day   = int(parts[2])
 
-        if u.get("done_today"):
-            await safe_edit(q, "Вже зафіксовано ✅")
-            return
         if done:
             u["step"] = "awaiting_difficulty"
             set_user(uid, u)
@@ -999,6 +996,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_feedback(uid, uname, day, "так", difficulty, feedback)
         u["step"]       = None
         u["done_today"] = True
+        u["last_done"]  = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
 
@@ -1130,17 +1128,51 @@ async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Юзера {uid_str} видалено.")
 
 async def cmd_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адмін: показати юзерів, які заблокували бота."""
+    """Адмін: показати юзерів що заблокували бота, і тих хто мовчить 3+ дні."""
     if update.effective_user.id != ADMIN_ID:
         return
     state = load_state(force_refresh=True)
-    inactive = [(uid, s) for uid, s in state.items() if s.get("inactive")]
-    if not inactive:
-        await update.message.reply_text("Неактивних юзерів не виявлено.")
+    today = datetime.now(TIMEZONE).date()
+
+    blocked  = []
+    sleeping = []
+
+    for uid, s in state.items():
+        day = s.get("day", 0)
+        if not (1 <= day <= 14):
+            continue
+        if s.get("inactive"):
+            blocked.append((uid, s))
+            continue
+        last_done_str = s.get("last_done", "")
+        if last_done_str:
+            try:
+                last_date = datetime.strptime(last_done_str, "%Y-%m-%d").date()
+                days_ago = (today - last_date).days
+                if days_ago >= 3:
+                    sleeping.append((uid, s, days_ago))
+            except ValueError:
+                pass
+        else:
+            # last_done порожній — юзер ще жодного дня не виконав
+            sleeping.append((uid, s, None))
+
+    lines = []
+    if blocked:
+        lines.append(f"🚫 Заблокували бота ({len(blocked)}):")
+        for uid, s in blocked:
+            lines.append(f"  id:{uid} — день {s.get('day', 0)}/14")
+
+    if sleeping:
+        lines.append(f"\n😴 Сплять 3+ дні ({len(sleeping)}):")
+        for uid, s, days_ago in sleeping:
+            last = s.get("last_done") or "ніколи"
+            ago_str = f"{days_ago} дн. тому" if days_ago is not None else "ніколи не виконував/ла"
+            lines.append(f"  id:{uid} — день {s.get('day', 0)}/14 · останнє виконання: {ago_str}")
+
+    if not lines:
+        await update.message.reply_text("Всі учасники активні 🎉")
         return
-    lines = [f"Заблокували бота ({len(inactive)}):"]
-    for uid, s in inactive:
-        lines.append(f"  id:{uid} — день {s.get('day', 0)}/14")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1209,6 +1241,40 @@ async def cmd_send_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+async def cmd_force_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: примусово запустити програму для юзера з day=0.
+    Використання: /force_start <uid>
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Використання: /force_start <uid>")
+        return
+    uid_str = context.args[0]
+    state = load_state()
+    if uid_str not in state:
+        await update.message.reply_text(f"ID {uid_str} не знайдено в базі.")
+        return
+    if state[uid_str].get("day", 0) > 0:
+        await update.message.reply_text(
+            f"Юзер {uid_str} вже в програмі (день {state[uid_str]['day']}). "
+            f"Використай /send_select для розсилки."
+        )
+        return
+    state[uid_str]["day"] = 1
+    state[uid_str]["done_today"] = False
+    state[uid_str]["step"] = None
+    save_state(state)
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid_str),
+            text=day_text(1),
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(f"✅ Юзеру {uid_str} надіслано день 1.")
+    except Exception as e:
+        await update.message.reply_text(f"Стан оновлено, але повідомлення не надійшло: {e}")
+
 async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін-команда: вручну надіслати завдання дня всім учасникам."""
     if update.effective_user.id != ADMIN_ID:
@@ -1233,6 +1299,7 @@ def main():
     app.add_handler(CommandHandler("test_day",   cmd_test_day))
     app.add_handler(CommandHandler("inactive",     cmd_inactive))
     app.add_handler(CommandHandler("remove_user",  cmd_remove_user))
+    app.add_handler(CommandHandler("force_start",  cmd_force_start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
