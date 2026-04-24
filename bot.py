@@ -572,8 +572,6 @@ def load_state(force_refresh=False) -> dict:
                 "step": row[2] if row[2] else None,
                 "difficulty": row[3],
                 "done_today": row[4] == "True",
-                "step_since": row[5] if len(row) > 5 else "",
-                "last_done": row[6] if len(row) > 6 else "",
             }
         _state_cache = state
         _cache_time = now
@@ -590,7 +588,7 @@ def save_state(state: dict):
     _cache_time = _time.time()
     try:
         ws = _get_state_sheet()
-        rows = [["uid", "day", "step", "difficulty", "done_today", "step_since", "last_done"]]
+        rows = [["uid", "day", "step", "difficulty", "done_today"]]
         for uid_str, s in state.items():
             rows.append([
                 uid_str,
@@ -598,8 +596,6 @@ def save_state(state: dict):
                 s.get("step") or "",
                 s.get("difficulty", ""),
                 str(s.get("done_today", False)),
-                s.get("step_since", ""),
-                s.get("last_done", ""),
             ])
         ws.clear()
         ws.update(rows, "A1")
@@ -763,7 +759,6 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     u["step"] = "awaiting_difficulty"
-    u["step_since"] = datetime.now(TIMEZONE).isoformat()
     set_user(uid, u)
     await update.message.reply_text(
         "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
@@ -885,9 +880,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, "")
         u["step"]       = None
-        u["step_since"] = ""
         u["done_today"] = True
-        u["last_done"]  = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
         reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
@@ -960,7 +953,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if done:
             u["step"] = "awaiting_difficulty"
-            u["step_since"] = datetime.now(TIMEZONE).isoformat()
             set_user(uid, u)
             await safe_edit(q, 
                 "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
@@ -1006,9 +998,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, feedback)
         u["step"]       = None
-        u["step_since"] = ""
         u["done_today"] = True
-        u["last_done"]  = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
 
@@ -1195,43 +1185,6 @@ async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(after["text"], parse_mode="Markdown")
 
-async def job_stuck_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Кожні 2 години нагадує юзерам, які застрягли в awaiting_* більше 2 годин."""
-    state = load_state()
-    now = datetime.now(TIMEZONE)
-    for uid_str, s in state.items():
-        step = s.get("step")
-        if step not in ("awaiting_difficulty", "awaiting_feedback"):
-            continue
-        step_since_str = s.get("step_since", "")
-        if not step_since_str:
-            continue
-        try:
-            from datetime import datetime as _dt
-            step_since = _dt.fromisoformat(step_since_str)
-            if (now - step_since).total_seconds() < 7200:  # менше 2 годин — пропускаємо
-                continue
-        except Exception:
-            continue
-        try:
-            if step == "awaiting_difficulty":
-                await context.bot.send_message(
-                    chat_id=int(uid_str),
-                    text="Нагадую — щоб завершити день, оціни складність завдання 👇",
-                    reply_markup=diff_kb(),
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=int(uid_str),
-                    text="Нагадую — можеш поділитись враженнями або натиснути «Пропустити» 👇",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("Пропустити", callback_data="skip_feedback"),
-                    ]]),
-                )
-            logger.info(f"Нагадування про stuck step надіслано {uid_str}")
-        except Exception as e:
-            logger.warning(f"Stuck reminder {uid_str}: {e}")
-
 async def cmd_send_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін: показує список юзерів з кнопками для вибіркової розсилки."""
     if update.effective_user.id != ADMIN_ID:
@@ -1292,9 +1245,7 @@ def main():
     app.job_queue.run_daily(
         job_spoiler_day5, time=SPOILER_TIME, days=tuple(range(7)), name="spoiler5"
     )
-    app.job_queue.run_repeating(
-        job_stuck_reminder, interval=7200, first=300, name="stuck_reminder"
-    )
+
 
     logger.info("Бот запущено.")
     if WEBHOOK_HOST:
