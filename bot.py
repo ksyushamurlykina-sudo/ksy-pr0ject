@@ -1,8 +1,17 @@
 """
 ksy-pr0ject v7 — 14-денна програма усвідомленого використання смартфону.
 
+Схема аркуша `state` (8 колонок):
+  A uid | B day | C step | D difficulty | E done_today
+  F step_since | G last_done | H inactive
+
 Зміни відносно v6.6:
-  • Поле `inactive` персиститься (6-та колонка в аркуші state).
+  • Колонки step_since і last_done зберігаються і автоматично оновлюються
+    (step_since — при кожній зміні step; last_done — при завершенні дня).
+  • Дати нормалізуються до YYYY-MM-DD (попередній баг з ISO+час виправлено).
+  • Поле `inactive` персиститься у колонці H.
+  • /inactive показує дві секції: заблокували бота + мовчать 3+ днів.
+  • /force_start <uid> — ручне просування застряглого юзера з day=0.
   • Фінальне повідомлення після дня 14 (з посиланням на пост-опитування).
   • POST_SURVEY_LINK підключено реальним URL.
   • Час розсилки узгоджено — всюди «09:35».
@@ -561,9 +570,42 @@ def _get_state_sheet():
     try:
         return workbook.worksheet("state")
     except gspread.exceptions.WorksheetNotFound:
-        ws = workbook.add_worksheet(title="state", rows=100, cols=6)
-        ws.append_row(["uid", "day", "step", "difficulty", "done_today", "inactive"])
+        ws = workbook.add_worksheet(title="state", rows=100, cols=8)
+        ws.append_row([
+            "uid", "day", "step", "difficulty", "done_today",
+            "step_since", "last_done", "inactive",
+        ])
         return ws
+
+def _normalize_date(raw: str) -> str:
+    """Приводить дату до YYYY-MM-DD (обрізає time-частину, якщо є)."""
+    if not raw:
+        return ""
+    return raw.split("T")[0].strip()
+
+def today_iso() -> str:
+    """Сьогоднішня дата у часовому поясі Києва, формат YYYY-MM-DD."""
+    return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+
+def set_step(u: dict, new_step):
+    """Змінює step і фіксує дату переходу у step_since."""
+    u["step"] = new_step
+    u["step_since"] = today_iso()
+
+def mark_done(u: dict):
+    """Фіксує, що юзер сьогодні завершив завдання."""
+    u["last_done"] = today_iso()
+
+def days_since(date_str: str):
+    """Скільки днів минуло від date_str до сьогодні. None, якщо дата невалідна."""
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(_normalize_date(date_str), "%Y-%m-%d").date()
+        today = datetime.now(TIMEZONE).date()
+        return (today - d).days
+    except Exception:
+        return None
 
 def load_state(force_refresh=False) -> dict:
     global _state_cache, _cache_time
@@ -577,17 +619,23 @@ def load_state(force_refresh=False) -> dict:
         for row in rows[1:]:  # пропускаємо заголовок
             if len(row) < 5:
                 continue
-            uid_str = row[0]
+            # Доповнюємо рядок до 8 колонок (старі записи можуть мати менше)
+            padded = row + [""] * (8 - len(row)) if len(row) < 8 else row
+            uid_str = padded[0]
+            if not uid_str:
+                continue
             try:
-                day = int(row[1])
+                day = int(padded[1])
             except ValueError:
                 day = 0
             state[uid_str] = {
                 "day": day,
-                "step": row[2] if row[2] else None,
-                "difficulty": row[3],
-                "done_today": row[4] == "True",
-                "inactive": (len(row) >= 6 and row[5] == "True"),
+                "step": padded[2] if padded[2] else None,
+                "difficulty": padded[3],
+                "done_today": padded[4] == "True",
+                "step_since": _normalize_date(padded[5]),
+                "last_done": _normalize_date(padded[6]),
+                "inactive": padded[7] == "True",
             }
         _state_cache = state
         _cache_time = now
@@ -603,7 +651,10 @@ def save_state(state: dict):
     _cache_time = systime.time()
     try:
         ws = _get_state_sheet()
-        rows = [["uid", "day", "step", "difficulty", "done_today", "inactive"]]
+        rows = [[
+            "uid", "day", "step", "difficulty", "done_today",
+            "step_since", "last_done", "inactive",
+        ]]
         for uid_str, s in state.items():
             rows.append([
                 uid_str,
@@ -611,6 +662,8 @@ def save_state(state: dict):
                 s.get("step") or "",
                 s.get("difficulty", ""),
                 str(s.get("done_today", False)),
+                _normalize_date(s.get("step_since", "")),
+                _normalize_date(s.get("last_done", "")),
                 str(s.get("inactive", False)),
             ])
         ws.clear()
@@ -624,7 +677,10 @@ def get_user(uid: int) -> dict:
     if key not in state:
         state[key] = {
             "day": 0, "step": None, "difficulty": "",
-            "done_today": False, "inactive": False,
+            "done_today": False,
+            "step_since": today_iso(),
+            "last_done": "",
+            "inactive": False,
         }
         save_state(state)
     return state[key]
@@ -743,7 +799,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Новий юзер — стандартний старт
     set_user(uid, {
         "day": 0, "step": None, "difficulty": "",
-        "done_today": False, "inactive": False,
+        "done_today": False,
+        "step_since": today_iso(),
+        "last_done": "",
+        "inactive": False,
     })
     await update.message.reply_text(
         day_text(0), parse_mode="Markdown", reply_markup=start_kb()
@@ -801,7 +860,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    u["step"] = "awaiting_difficulty"
+    set_step(u, "awaiting_difficulty")
     set_user(uid, u)
     await update.message.reply_text(
         "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
@@ -872,7 +931,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_restart_requests.discard(target_uid)
         set_user(target_uid, {
             "day": 0, "step": None, "difficulty": "",
-            "done_today": False, "inactive": False,
+            "done_today": False,
+            "step_since": today_iso(),
+            "last_done": "",
+            "inactive": False,
         })
         await context.bot.send_message(
             chat_id=target_uid,
@@ -925,7 +987,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day = u.get("day", 0)
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, "")
-        u["step"]       = None
+        set_step(u, None)
+        mark_done(u)
         u["done_today"] = True
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
@@ -977,7 +1040,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("diff_"):
         emoji = data.replace("diff_", "")
         u["difficulty"] = f"{emoji} {DIFFICULTY_LABELS.get(emoji, '')}"
-        u["step"] = "awaiting_feedback"
+        set_step(u, "awaiting_feedback")
         set_user(uid, u)
         await safe_edit(q,
             f"Зафіксувала: {u['difficulty']}\n\n"
@@ -996,7 +1059,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day   = int(parts[2])
 
         if done:
-            u["step"] = "awaiting_difficulty"
+            set_step(u, "awaiting_difficulty")
             set_user(uid, u)
             await safe_edit(q,
                 "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
@@ -1060,7 +1123,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         feedback   = "" if text.strip() == "–" else text
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, feedback)
-        u["step"]       = None
+        set_step(u, None)
+        mark_done(u)
         u["done_today"] = True
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
@@ -1115,7 +1179,10 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
             day = 1
 
         s["done_today"] = False
-        s["step"] = None  # скидаємо незавершений фідбек
+        # скидаємо незавершений фідбек; фіксуємо дату переходу
+        if s.get("step") is not None:
+            s["step_since"] = today_iso()
+        s["step"] = None
         state[uid_str] = s
 
         if 1 <= day <= 14:
@@ -1197,18 +1264,78 @@ async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Юзера {uid_str} видалено.")
 
 async def cmd_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адмін: показати юзерів, які заблокували бота."""
+    """Адмін: дві секції — заблокували бота та мовчать 3+ днів."""
     if update.effective_user.id != ADMIN_ID:
         return
     state = load_state(force_refresh=True)
-    inactive = [(uid, s) for uid, s in state.items() if s.get("inactive")]
-    if not inactive:
-        await update.message.reply_text("Неактивних юзерів не виявлено.")
+    blocked = [(uid, s) for uid, s in state.items() if s.get("inactive")]
+
+    silent = []
+    for uid, s in state.items():
+        if s.get("inactive"):
+            continue
+        day = s.get("day", 0)
+        if day < 1 or day > 14:
+            continue
+        # беремо last_done, якщо є; інакше — step_since як fallback
+        anchor = s.get("last_done") or s.get("step_since")
+        n = days_since(anchor)
+        if n is not None and n >= 3:
+            silent.append((uid, s, n, anchor))
+
+    if not blocked and not silent:
+        await update.message.reply_text("Усі активні — ніхто не заблокував і ніхто не мовчить 3+ днів.")
         return
-    lines = [f"Заблокували бота ({len(inactive)}):"]
-    for uid, s in inactive:
-        lines.append(f"  id:{uid} — день {s.get('day', 0)}/14")
+
+    lines = []
+    if blocked:
+        lines.append(f"🔒 Заблокували бота ({len(blocked)}):")
+        for uid, s in blocked:
+            lines.append(f"  id:{uid} — день {s.get('day', 0)}/14")
+        lines.append("")
+    if silent:
+        lines.append(f"😶 Мовчать 3+ днів ({len(silent)}):")
+        for uid, s, n, anchor in sorted(silent, key=lambda x: -x[2]):
+            lines.append(f"  id:{uid} — день {s.get('day', 0)}/14, останній раз {anchor} ({n} дн. тому)")
     await update.message.reply_text("\n".join(lines))
+
+async def cmd_force_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: ручне просування застряглого юзера з day=0.
+    Використання: /force_start 123456789
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Використання: /force_start <uid>")
+        return
+    uid_str = context.args[0]
+    state = load_state(force_refresh=True)
+    s = state.get(uid_str)
+    if not s:
+        await update.message.reply_text(f"ID {uid_str} не знайдено.")
+        return
+    if s.get("day", 0) != 0:
+        await update.message.reply_text(
+            f"Юзер {uid_str} уже на дні {s.get('day')} — force_start не потрібен."
+        )
+        return
+    s["day"] = 1
+    s["done_today"] = False
+    s["step"] = None
+    s["step_since"] = today_iso()
+    state[uid_str] = s
+    save_state(state)
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid_str),
+            text=day_text(1),
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(f"✅ Юзера {uid_str} переведено на день 1, завдання надіслано.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"✅ Стан юзера {uid_str} оновлено, але повідомлення не надійшло: {e}"
+        )
 
 async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін: надіслати собі будь-який день без зміни стану учасників.
@@ -1349,6 +1476,7 @@ def main():
     app.add_handler(CommandHandler("test_day",    cmd_test_day))
     app.add_handler(CommandHandler("inactive",    cmd_inactive))
     app.add_handler(CommandHandler("remove_user", cmd_remove_user))
+    app.add_handler(CommandHandler("force_start", cmd_force_start))
     app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
