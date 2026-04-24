@@ -1,8 +1,24 @@
 """
-ksy-pr0ject v5.1 — оновлені тексти з Notion + UX-покращення
+ksy-pr0ject v7 — 14-денна програма усвідомленого використання смартфону.
+
+Зміни відносно v6.6:
+  • Поле `inactive` персиститься (6-та колонка в аркуші state).
+  • Фінальне повідомлення після дня 14 (з посиланням на пост-опитування).
+  • POST_SURVEY_LINK підключено реальним URL.
+  • Час розсилки узгоджено — всюди «09:35».
+  • Навігація по днях не пускає на неіснуючий день 15.
+  • Захист від повторних /start (anti-spam поки запит очікує відповіді).
+  • handle_message коректно реагує на текст у стані `awaiting_difficulty`.
+  • handle_message скидає прапорець `inactive` коли користувач повертається.
+  • Fallback для reply-відповідей адміна через regex на id (переживає рестарт).
+  • /broadcast — повернено (розсилка всім або одному юзеру).
+  • Прибрано мертвий STATE_FILE. Імпорт time уніфіковано.
+  • job_morning пропускає завершених (day>14) і заблокованих.
 """
 import logging, os, json, random
+import time as systime
 from datetime import datetime, time
+import re
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,8 +38,7 @@ TIMEZONE          = pytz.timezone("Europe/Kyiv")
 MORNING_TIME      = time(9, 35, tzinfo=TIMEZONE)
 EVENING_TIME      = time(20, 0, tzinfo=TIMEZONE)
 SPOILER_TIME      = time(17, 50, tzinfo=TIMEZONE)
-STATE_FILE        = "state.json"
-POST_SURVEY_LINK  = "ВСТАВТЕ_ПОСИЛАННЯ"
+POST_SURVEY_LINK  = "https://forms.gle/7JgTtaecVXYjiKJV7"
 
 # ─── КОНТЕНТ ДНІВ ─────────────────────────────────────────────────────────────
 
@@ -35,7 +50,7 @@ DAYS = {
             "Наступні 14 днів ви братимете участь у програмі усвідомленого "
             "використання смартфона.\n\n"
             "Як усе влаштовано:\n"
-            "— Щоранку о 09:00 — завдання дня (~10–15 хв)\n"
+            "— Щоранку о 09:35 — завдання дня (~10–15 хв)\n"
             "— Ввечері о 20:00 — нагадування про завдання, якщо не виконали до цього часу\n"
             "— Коли виконаєте завдання — надішліть /done\n"
             "— Після виконання у вас буде можливість оцінити складність\n"
@@ -531,6 +546,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 pending_replies: dict = {}
+pending_restart_requests: set = set()  # uid-и з відкритим запитом на рестарт
 
 # ─── СТАН (Google Sheets аркуш "state" — основне сховище) ─────────────────────
 
@@ -545,14 +561,13 @@ def _get_state_sheet():
     try:
         return workbook.worksheet("state")
     except gspread.exceptions.WorksheetNotFound:
-        ws = workbook.add_worksheet(title="state", rows=100, cols=5)
-        ws.append_row(["uid", "day", "step", "difficulty", "done_today"])
+        ws = workbook.add_worksheet(title="state", rows=100, cols=6)
+        ws.append_row(["uid", "day", "step", "difficulty", "done_today", "inactive"])
         return ws
 
 def load_state(force_refresh=False) -> dict:
     global _state_cache, _cache_time
-    import time as _time
-    now = _time.time()
+    now = systime.time()
     if _state_cache and not force_refresh and (now - _cache_time) < CACHE_TTL:
         return _state_cache
     try:
@@ -572,6 +587,7 @@ def load_state(force_refresh=False) -> dict:
                 "step": row[2] if row[2] else None,
                 "difficulty": row[3],
                 "done_today": row[4] == "True",
+                "inactive": (len(row) >= 6 and row[5] == "True"),
             }
         _state_cache = state
         _cache_time = now
@@ -583,12 +599,11 @@ def load_state(force_refresh=False) -> dict:
 
 def save_state(state: dict):
     global _state_cache, _cache_time
-    import time as _time
     _state_cache = state
-    _cache_time = _time.time()
+    _cache_time = systime.time()
     try:
         ws = _get_state_sheet()
-        rows = [["uid", "day", "step", "difficulty", "done_today"]]
+        rows = [["uid", "day", "step", "difficulty", "done_today", "inactive"]]
         for uid_str, s in state.items():
             rows.append([
                 uid_str,
@@ -596,6 +611,7 @@ def save_state(state: dict):
                 s.get("step") or "",
                 s.get("difficulty", ""),
                 str(s.get("done_today", False)),
+                str(s.get("inactive", False)),
             ])
         ws.clear()
         ws.update(rows, "A1")
@@ -606,7 +622,10 @@ def get_user(uid: int) -> dict:
     state = load_state()
     key = str(uid)
     if key not in state:
-        state[key] = {"day": 0, "step": None, "difficulty": "", "done_today": False}
+        state[key] = {
+            "day": 0, "step": None, "difficulty": "",
+            "done_today": False, "inactive": False,
+        }
         save_state(state)
     return state[key]
 
@@ -674,6 +693,19 @@ def start_kb():
         InlineKeyboardButton("Почати", callback_data="begin"),
     ]])
 
+def completion_text(day: int, reaction: str) -> str:
+    """Формує повідомлення після завершення дня.
+    Для дня 14 — фінал із посиланням на пост-опитування."""
+    if day >= 14:
+        return (
+            f"{reaction}\n\n"
+            "🎉 Ви завершили 14-денну програму!\n\n"
+            "Дякую, що пройшли цей шлях. Будь ласка, заповніть "
+            "фінальне опитування — воно критично важливе для дослідження:\n"
+            f"{POST_SURVEY_LINK}"
+        )
+    return f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}."
+
 # ─── КОМАНДИ ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -683,6 +715,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Якщо юзер вже існує — питаємо адміна
     if str(uid) in state and state[str(uid)].get("day", 0) > 0:
+        if uid in pending_restart_requests:
+            await update.message.reply_text(
+                "Ваш запит на перезапуск вже надіслано досліднику. Дочекайтесь відповіді 🙏"
+            )
+            return
+        pending_restart_requests.add(uid)
         current_day = state[str(uid)]["day"]
         await update.message.reply_text(
             "Ваш запит на перезапуск надіслано досліднику. Очікуйте підтвердження."
@@ -703,7 +741,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Новий юзер — стандартний старт
-    set_user(uid, {"day": 0, "step": None, "difficulty": "", "done_today": False})
+    set_user(uid, {
+        "day": 0, "step": None, "difficulty": "",
+        "done_today": False, "inactive": False,
+    })
     await update.message.reply_text(
         day_text(0), parse_mode="Markdown", reply_markup=start_kb()
     )
@@ -711,10 +752,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Доступні команди:*\n\n"
+        "/start — почати програму\n"
         "/day — завдання поточного дня\n"
         "/done — позначити завдання виконаним\n"
         "/progress — ваш прогрес\n"
-        "/help — ця довідка",
+        "/help — ця довідка\n\n"
+        "_Будь-яке ваше повідомлення я передаю досліднику — вона відповість особисто._",
         parse_mode="Markdown",
     )
 
@@ -723,18 +766,18 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = u["day"]
     if day < 1:
         await update.message.reply_text(
-            "Програма ще не почалась. Перше завдання прийде завтра о 09:00."
+            "Програма ще не почалась. Перше завдання прийде завтра о 09:35."
         )
         return
     kb = None
     if day > 1:
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
-                "Переглянути попередні дні", callback_data=f"nav_{day - 1}"
+                "Переглянути попередні дні", callback_data=f"nav_{min(day, 14) - 1}"
             ),
         ]])
     await update.message.reply_text(
-        day_text(day), parse_mode="Markdown", reply_markup=kb
+        day_text(min(day, 14)), parse_mode="Markdown", reply_markup=kb
     )
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -769,7 +812,7 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = u["day"]
     if day < 1:
         await update.message.reply_text(
-            "Програма ще не почалась. Перше завдання прийде завтра о 09:00."
+            "Програма ще не почалась. Перше завдання прийде завтра о 09:35."
         )
         return
     completed = max(0, day - 1) if day <= 14 else 14
@@ -790,7 +833,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"Учасників: {len(state)}\n"]
     for uid, s in state.items():
-        lines.append(f"  {uid} — день {s.get('day', 0)}/14")
+        flag = " 🔒" if s.get("inactive") else ""
+        lines.append(f"  {uid} — день {s.get('day', 0)}/14{flag}")
     await update.message.reply_text("\n".join(lines))
 
 # ─── КНОПКИ ──────────────────────────────────────────────────────────────────
@@ -825,7 +869,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Дозвіл/відхилення перезапуску (адмін) ---
     if data.startswith("restart_yes_"):
         target_uid = int(data.replace("restart_yes_", ""))
-        set_user(target_uid, {"day": 0, "step": None, "difficulty": "", "done_today": False})
+        pending_restart_requests.discard(target_uid)
+        set_user(target_uid, {
+            "day": 0, "step": None, "difficulty": "",
+            "done_today": False, "inactive": False,
+        })
         await context.bot.send_message(
             chat_id=target_uid,
             text="Дослідник дозволив перезапуск. Починаємо спочатку!",
@@ -841,6 +889,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("restart_no_"):
         target_uid = int(data.replace("restart_no_", ""))
+        pending_restart_requests.discard(target_uid)
         await context.bot.send_message(
             chat_id=target_uid,
             text="Дослідник відхилив запит на перезапуск. Ваш прогрес збережено — продовжуйте з того місця, де зупинились.",
@@ -873,9 +922,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Пропустити фідбек ---
     if data == "skip_feedback":
-        if u.get("done_today") or u.get("step") != "awaiting_feedback":
-            await safe_edit(q, "Вже зафіксовано ✅")
-            return
         day = u.get("day", 0)
         difficulty = u.get("difficulty", "")
         save_feedback(uid, uname, day, "так", difficulty, "")
@@ -884,7 +930,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["day"]        = min(day + 1, 15)
         set_user(uid, u)
         reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
-        await safe_edit(q, f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}.")
+        await safe_edit(q, completion_text(day, reaction))
         await send_after_day_message(context.bot, uid, day)
         return
 
@@ -905,7 +951,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("nav_"):
         view_day = int(data.replace("nav_", ""))
         current  = u["day"]
-        if view_day > current or view_day < 1:
+        cap = min(current, 14)  # не пускаємо на неіснуючий день 15
+        if view_day > cap or view_day < 1:
             return
         buttons = []
         if view_day > 1:
@@ -914,14 +961,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"< День {view_day - 1}", callback_data=f"nav_{view_day - 1}"
                 )
             )
-        if view_day < current:
+        if view_day < cap:
             buttons.append(
                 InlineKeyboardButton(
                     f"День {view_day + 1} >", callback_data=f"nav_{view_day + 1}"
                 )
             )
         kb = InlineKeyboardMarkup([buttons]) if buttons else None
-        await safe_edit(q, 
+        await safe_edit(q,
             day_text(view_day), parse_mode="Markdown", reply_markup=kb
         )
         return
@@ -932,7 +979,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u["difficulty"] = f"{emoji} {DIFFICULTY_LABELS.get(emoji, '')}"
         u["step"] = "awaiting_feedback"
         set_user(uid, u)
-        await safe_edit(q, 
+        await safe_edit(q,
             f"Зафіксувала: {u['difficulty']}\n\n"
             "Поділіться враженнями або задайте запитання. "
             "Я відповім на нього особисто.",
@@ -948,18 +995,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         done  = parts[1] == "yes"
         day   = int(parts[2])
 
-        if u.get("done_today"):
-            await safe_edit(q, "Вже зафіксовано ✅")
-            return
         if done:
             u["step"] = "awaiting_difficulty"
             set_user(uid, u)
-            await safe_edit(q, 
+            await safe_edit(q,
                 "Як вам вдалося сьогоднішнє завдання?", reply_markup=diff_kb()
             )
         else:
             save_feedback(uid, uname, day, "ні", "", "")
-            await safe_edit(q, 
+            await safe_edit(q,
                 "Нічого страшного. Завтра надішлю це ж завдання ще раз."
             )
 
@@ -973,6 +1017,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Адмін відповідає reply → пересилаємо учаснику
     if uid == ADMIN_ID and update.message.reply_to_message:
         target = pending_replies.get(update.message.reply_to_message.message_id)
+        # Fallback: витягуємо id з тексту пересланого фідбеку (переживає рестарт)
+        if not target:
+            src_text = update.message.reply_to_message.text or ""
+            m = re.search(r"id:\s*(\d+)", src_text)
+            if m:
+                target = int(m.group(1))
         if target:
             try:
                 await context.bot.send_message(
@@ -991,6 +1041,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     u   = get_user(uid)
     day = u.get("day", 0)
+
+    # Якщо юзер писав — він не заблокував бота; скидаємо прапорець
+    if u.get("inactive"):
+        u["inactive"] = False
+        set_user(uid, u)
+
+    # Очікуємо натискання кнопки складності — нагадаємо
+    if u.get("step") == "awaiting_difficulty":
+        await update.message.reply_text(
+            "Будь ласка, спершу оцініть складність кнопкою вище 👆",
+            reply_markup=diff_kb(),
+        )
+        return
 
     # Фідбек після вибору складності
     if u.get("step") == "awaiting_feedback":
@@ -1018,9 +1081,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reaction = random.choice(FEEDBACK_SKIP_REACTIONS)
 
-        await update.message.reply_text(
-            f"{reaction}\n✅ День {day} виконано! Завтра о 09:35 — завдання дня {day + 1}."
-        )
+        await update.message.reply_text(completion_text(day, reaction))
         await send_after_day_message(context.bot, uid, day)
         return
 
@@ -1044,6 +1105,10 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
     state = load_state(force_refresh=True)
     for uid_str, s in state.items():
         day = s.get("day", 0)
+
+        # Пропускаємо завершених і заблокованих
+        if day > 14 or s.get("inactive"):
+            continue
 
         if day == 0:
             s["day"] = 1
@@ -1075,7 +1140,7 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
     for uid_str, s in state.items():
         day = s.get("day", 0)
 
-        if s.get("done_today"):
+        if s.get("done_today") or s.get("inactive"):
             continue
 
         if 1 <= day <= 14:
@@ -1100,7 +1165,7 @@ async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
     """Відправляє спойлер о 17:50 тим, хто зараз на дні 5."""
     state = load_state()
     for uid_str, s in state.items():
-        if s.get("day") == 5 and not s.get("done_today"):
+        if s.get("day") == 5 and not s.get("done_today") and not s.get("inactive"):
             try:
                 await context.bot.send_message(
                     chat_id=int(uid_str),
@@ -1112,6 +1177,8 @@ async def job_spoiler_day5(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Спойлер 5 {uid_str}: неактивний юзер — {e}")
                 else:
                     logger.error(f"Спойлер 5 {uid_str}: {e}")
+
+# ─── АДМІН-КОМАНДИ ───────────────────────────────────────────────────────────
 
 async def cmd_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін: видалити юзера зі стану за ID. Використання: /remove_user 123456789"""
@@ -1199,13 +1266,14 @@ async def cmd_send_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day = s.get("day", 0)
         if 1 <= day <= 14:
             done = "✅" if s.get("done_today") else "⏳"
-            label = f"{done} id:{uid_str} · день {day}"
+            inact = " 🔒" if s.get("inactive") else ""
+            label = f"{done} id:{uid_str} · день {day}{inact}"
             buttons.append([InlineKeyboardButton(label, callback_data=f"sendone_{uid_str}")])
     if not buttons:
         await update.message.reply_text("Немає активних учасників.")
         return
     await update.message.reply_text(
-        "Оберіть учасника — надішлю йому завдання поточного дня:\n✅ = вже виконав, ⏳ = ще ні",
+        "Оберіть учасника — надішлю йому завдання поточного дня:\n✅ = вже виконав, ⏳ = ще ні, 🔒 = заблокував бота",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -1218,21 +1286,70 @@ async def cmd_send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await job_morning(context)
     await update.message.reply_text("Готово — завдання дня надіслані всім учасникам.")
 
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: надіслати довільне повідомлення всім або конкретному юзеру.
+    /broadcast Текст повідомлення — всім активним учасникам
+    /broadcast 123456789 Текст — конкретному юзеру
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Використання:\n/broadcast Текст — всім\n/broadcast ID Текст — одному"
+        )
+        return
+
+    # Перевіряємо чи перший аргумент — ID
+    if context.args[0].isdigit():
+        target_uid = int(context.args[0])
+        text = " ".join(context.args[1:])
+        if not text:
+            await update.message.reply_text("Вкажіть текст після ID.")
+            return
+        try:
+            await context.bot.send_message(chat_id=target_uid, text=text)
+            await update.message.reply_text(f"✅ Надіслано до {target_uid}.")
+        except Exception as e:
+            await update.message.reply_text(f"Помилка: {e}")
+        return
+
+    # Інакше — розсилка всім активним (day>=1, не inactive)
+    text = " ".join(context.args)
+    state = load_state(force_refresh=True)
+    ok, fail, skipped = 0, 0, 0
+    for uid_str, s in state.items():
+        if s.get("day", 0) < 1:
+            skipped += 1
+            continue
+        if s.get("inactive"):
+            skipped += 1
+            continue
+        try:
+            await context.bot.send_message(chat_id=int(uid_str), text=text)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.warning(f"Broadcast fail {uid_str}: {e}")
+    await update.message.reply_text(
+        f"✅ Надіслано: {ok}\n❌ Помилок: {fail}\n⏭ Пропущено: {skipped}"
+    )
+
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("day",      cmd_day))
-    app.add_handler(CommandHandler("done",     cmd_done))
-    app.add_handler(CommandHandler("progress", cmd_progress))
-    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("day",         cmd_day))
+    app.add_handler(CommandHandler("done",        cmd_done))
+    app.add_handler(CommandHandler("progress",    cmd_progress))
+    app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CommandHandler("send_now",    cmd_send_now))
     app.add_handler(CommandHandler("send_select", cmd_send_select))
-    app.add_handler(CommandHandler("test_day",   cmd_test_day))
-    app.add_handler(CommandHandler("inactive",     cmd_inactive))
-    app.add_handler(CommandHandler("remove_user",  cmd_remove_user))
+    app.add_handler(CommandHandler("test_day",    cmd_test_day))
+    app.add_handler(CommandHandler("inactive",    cmd_inactive))
+    app.add_handler(CommandHandler("remove_user", cmd_remove_user))
+    app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1246,8 +1363,7 @@ def main():
         job_spoiler_day5, time=SPOILER_TIME, days=tuple(range(7)), name="spoiler5"
     )
 
-
-    logger.info("Бот запущено.")
+    logger.info("Бот запущено (v7).")
     if WEBHOOK_HOST:
         # Railway / production — webhook (без конфліктів між деплоями)
         webhook_url = f"https://{WEBHOOK_HOST}"
