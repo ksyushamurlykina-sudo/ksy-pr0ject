@@ -1174,6 +1174,20 @@ async def job_morning(context: ContextTypes.DEFAULT_TYPE):
         if day > 14 or s.get("inactive"):
             continue
 
+        # Якщо юзер застряг у фідбеці з попереднього дня — авто-закриваємо.
+        # Семантика: складність уже могла бути обрана, фідбек опціональний,
+        # тож просто фіксуємо «виконано без фідбеку» і просуваємо далі.
+        if s.get("step") in ("awaiting_difficulty", "awaiting_feedback") and 1 <= day <= 14:
+            difficulty = s.get("difficulty", "")
+            try:
+                save_feedback(int(uid_str), uid_str, day, "так (авто)", difficulty, "")
+            except Exception as e:
+                logger.error(f"Авто-закриття дня {day} для {uid_str}: {e}")
+            s["last_done"] = s.get("step_since") or today_iso()
+            s["day"] = min(day + 1, 15)
+            day = s["day"]
+            logger.info(f"Авто-закрито застряглий день у {uid_str} → переведено на день {day}")
+
         if day == 0:
             s["day"] = 1
             day = 1
@@ -1337,6 +1351,66 @@ async def cmd_force_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Стан юзера {uid_str} оновлено, але повідомлення не надійшло: {e}"
         )
 
+async def cmd_unstick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Адмін: розблокувати юзера, що застряг у awaiting_difficulty/awaiting_feedback.
+    Закриває поточний день з тією складністю, що вже є (фідбек = порожній),
+    просуває на наступний день і одразу шле нове завдання.
+    Використання: /unstick 123456789
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Використання: /unstick <uid>")
+        return
+    uid_str = context.args[0]
+    state = load_state(force_refresh=True)
+    s = state.get(uid_str)
+    if not s:
+        await update.message.reply_text(f"ID {uid_str} не знайдено.")
+        return
+    step = s.get("step")
+    if step not in ("awaiting_difficulty", "awaiting_feedback"):
+        await update.message.reply_text(
+            f"Юзер {uid_str} не застряг (step={step or 'None'}). "
+            f"Поточний день: {s.get('day')}, done_today={s.get('done_today')}."
+        )
+        return
+
+    day = s.get("day", 0)
+    difficulty = s.get("difficulty", "")
+    try:
+        save_feedback(int(uid_str), uid_str, day, "так (адмін unstick)", difficulty, "")
+    except Exception as e:
+        logger.error(f"Unstick: помилка save_feedback для {uid_str}: {e}")
+
+    s["last_done"] = s.get("step_since") or today_iso()
+    s["day"] = min(day + 1, 15)
+    s["step"] = None
+    s["step_since"] = today_iso()
+    s["done_today"] = False
+    new_day = s["day"]
+    state[uid_str] = s
+    save_state(state)
+
+    if 1 <= new_day <= 14:
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid_str),
+                text=day_text(new_day),
+                parse_mode="Markdown",
+            )
+            await update.message.reply_text(
+                f"✅ Юзер {uid_str}: день {day} закрито, переведено на день {new_day}, завдання надіслано."
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"✅ Стан оновлено (день {day} → {new_day}), але повідомлення не надійшло: {e}"
+            )
+    else:
+        await update.message.reply_text(
+            f"✅ Юзер {uid_str}: день {day} закрито, програму завершено (день {new_day})."
+        )
+
 async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Адмін: надіслати собі будь-який день без зміни стану учасників.
     Використання: /test_day 3
@@ -1477,6 +1551,7 @@ def main():
     app.add_handler(CommandHandler("inactive",    cmd_inactive))
     app.add_handler(CommandHandler("remove_user", cmd_remove_user))
     app.add_handler(CommandHandler("force_start", cmd_force_start))
+    app.add_handler(CommandHandler("unstick",     cmd_unstick))
     app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
