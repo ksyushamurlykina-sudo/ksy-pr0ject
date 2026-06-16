@@ -834,6 +834,15 @@ def day_text(n: int) -> str:
     suffix = "\n\n_Коли виконаєте — надішліть /done_" if n >= 1 else ""
     return f"*{d['badge']}*\n\n*{d['title']}*\n\n{d['text']}{suffix}"
 
+def reflect_block(day: int) -> str:
+    """Текст запиту рефлексії: контекстне питання дня + ротаційний хвіст."""
+    prompt = REFLECT_PROMPTS.get(day, "Що ви помітили сьогодні?")
+    if day >= 24:
+        tail = "Дякую, що ділилися весь місяць — ваші нотатки справді допомагали мені бачити, як іде шлях у кожного."
+    else:
+        tail = REFLECT_TAILS[day % len(REFLECT_TAILS)]
+    return f"{prompt}\n\n{tail}"
+
 def diff_kb():
     return InlineKeyboardMarkup([
         [
@@ -1166,14 +1175,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_step(u, "awaiting_feedback")
         set_user(uid, u)
         day_done = u.get("day", 0)
-        prompt = REFLECT_PROMPTS.get(day_done, "Що ви помітили сьогодні?")
-        if day_done >= 24:
-            tail = "Дякую, що ділилися весь місяць — ваші нотатки справді допомагали мені бачити, як іде шлях у кожного."
-        else:
-            tail = REFLECT_TAILS[day_done % len(REFLECT_TAILS)]
         await safe_edit(q,
-            f"Зафіксувала: {u['difficulty']}\n\n"
-            f"{prompt}\n\n{tail}",
+            f"Зафіксувала: {u['difficulty']}\n\n" + reflect_block(day_done),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Пропустити", callback_data="skip_feedback"),
             ]]),
@@ -1663,6 +1666,11 @@ async def cmd_test_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=eve_kb(n),
         )
+        await update.message.reply_text(
+            f"🧪 _Запит рефлексії дня {n} (після оцінки складності):_",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(reflect_block(n))
 
     # Показати підсумок блоку, якщо є
     after = AFTER_DAY.get(n)
